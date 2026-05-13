@@ -41,16 +41,163 @@ interface AuthEnv extends Env {
 }
 
 const env = cloudflareEnv as AuthEnv
+const REFRESH_GUARD_PREFIX = 'oauth:refresh-guard'
+const REFRESH_IN_FLIGHT_TTL_SECONDS = 60
+const REFRESH_FAILURE_TTL_SECONDS = 3600
+const refreshInFlight = new Map<string, Promise<TokenExchangeCallbackResult | undefined>>()
 
-function throwCombinedCloudflareApiError(userStatus: number, accountsStatus: number): never {
-  const statuses = [userStatus, accountsStatus]
+async function sha256Hex(value: string): Promise<string> {
+  const data = new TextEncoder().encode(value)
+  const digest = await crypto.subtle.digest('SHA-256', data)
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+function refreshGuardKeys(refreshTokenHash: string): { inFlight: string; failure: string } {
+  return {
+    inFlight: `${REFRESH_GUARD_PREFIX}:${refreshTokenHash}:in-flight`,
+    failure: `${REFRESH_GUARD_PREFIX}:${refreshTokenHash}:failure`
+  }
+}
+
+function isTerminalRefreshError(error: unknown): error is OAuthError {
+  return (
+    error instanceof OAuthError &&
+    ['invalid_grant', 'invalid_client', 'unauthorized_client'].includes(error.code)
+  )
+}
+
+async function getCachedRefreshFailure(
+  kv: KVNamespace,
+  failureKey: string
+): Promise<{ code?: string; description?: string } | null> {
+  try {
+    const failure = await kv.get(failureKey, { type: 'json' })
+    if (!failure || typeof failure !== 'object') return null
+    return failure as { code?: string; description?: string }
+  } catch (error) {
+    console.warn('Refresh guard: failed to read cached refresh failure', error)
+    return null
+  }
+}
+
+async function isRefreshInFlight(kv: KVNamespace, inFlightKey: string): Promise<boolean> {
+  try {
+    return Boolean(await kv.get(inFlightKey))
+  } catch (error) {
+    console.warn('Refresh guard: failed to read in-flight marker', error)
+    return false
+  }
+}
+
+async function markRefreshInFlight(kv: KVNamespace, inFlightKey: string): Promise<void> {
+  try {
+    await kv.put(inFlightKey, JSON.stringify({ startedAt: Date.now() }), {
+      expirationTtl: REFRESH_IN_FLIGHT_TTL_SECONDS
+    })
+  } catch (error) {
+    console.warn('Refresh guard: failed to write in-flight marker', error)
+  }
+}
+
+async function cacheRefreshFailure(
+  kv: KVNamespace,
+  failureKey: string,
+  error: OAuthError
+): Promise<void> {
+  try {
+    await kv.put(
+      failureKey,
+      JSON.stringify({
+        code: error.code,
+        description: 'Token refresh failed; reauthorization is required',
+        failedAt: Date.now()
+      }),
+      { expirationTtl: REFRESH_FAILURE_TTL_SECONDS }
+    )
+  } catch (cacheError) {
+    console.warn('Refresh guard: failed to cache terminal refresh failure', cacheError)
+  }
+}
+
+async function clearRefreshInFlight(kv: KVNamespace, inFlightKey: string): Promise<void> {
+  try {
+    await kv.delete(inFlightKey)
+  } catch (error) {
+    console.warn('Refresh guard: failed to clear in-flight marker', error)
+  }
+}
+
+export async function guardRefreshTokenExchange(
+  kv: KVNamespace,
+  refreshToken: string,
+  refresh: () => Promise<TokenExchangeCallbackResult | undefined>
+): Promise<TokenExchangeCallbackResult | undefined> {
+  const refreshTokenHash = await sha256Hex(refreshToken)
+  const keys = refreshGuardKeys(refreshTokenHash)
+  const existingRefresh = refreshInFlight.get(refreshTokenHash)
+  if (existingRefresh) return existingRefresh
+
+  const refreshPromise = (async () => {
+    try {
+      const cachedFailure = await getCachedRefreshFailure(kv, keys.failure)
+      if (cachedFailure) {
+        throw new OAuthError(
+          cachedFailure.code || 'invalid_grant',
+          cachedFailure.description || 'Token refresh recently failed; reauthorization is required',
+          400
+        )
+      }
+
+      if (await isRefreshInFlight(kv, keys.inFlight)) {
+        throw new OAuthError(
+          'temporarily_unavailable',
+          'Token refresh is already in progress; retry shortly',
+          429,
+          { 'Retry-After': '30' }
+        )
+      }
+
+      await markRefreshInFlight(kv, keys.inFlight)
+
+      try {
+        return await refresh()
+      } catch (error) {
+        if (isTerminalRefreshError(error)) {
+          await cacheRefreshFailure(kv, keys.failure, error)
+        }
+        throw error
+      } finally {
+        await clearRefreshInFlight(kv, keys.inFlight)
+      }
+    } finally {
+      refreshInFlight.delete(refreshTokenHash)
+    }
+  })()
+
+  refreshInFlight.set(refreshTokenHash, refreshPromise)
+  return refreshPromise
+}
+
+function getRetryAfterHeader(...responses: Response[]): Record<string, string> {
+  return {
+    'Retry-After':
+      responses.find((response) => response.status === 429)?.headers.get('Retry-After') ?? '30'
+  }
+}
+
+function throwCombinedCloudflareApiError(userResp: Response, accountsResp: Response): never {
+  const statuses = [userResp.status, accountsResp.status]
 
   if (statuses.some((status) => status >= 500)) {
     throw new OAuthError('server_error', 'Cloudflare API is temporarily unavailable', 502)
   }
 
   if (statuses.includes(429)) {
-    throw new OAuthError('temporarily_unavailable', 'Rate limited, try again later', 429)
+    throw new OAuthError('temporarily_unavailable', 'Rate limited, try again later', 429, {
+      ...getRetryAfterHeader(userResp, accountsResp)
+    })
   }
 
   if (statuses.includes(401)) {
@@ -61,7 +208,7 @@ function throwCombinedCloudflareApiError(userStatus: number, accountsStatus: num
     throw new OAuthError('insufficient_scope', 'Insufficient permissions', 403)
   }
 
-  throw new OAuthError('invalid_token', 'Failed to verify token', userStatus)
+  throw new OAuthError('invalid_token', 'Failed to verify token', userResp.status)
 }
 
 async function fetchCloudflareProbes(accessToken: string): Promise<[Response, Response]> {
@@ -90,7 +237,7 @@ export async function getUserAndAccounts(accessToken: string): Promise<{
   // Check for upstream errors before parsing
   if (!userResp.ok && !accountsResp.ok) {
     console.error(`Cloudflare API error: user=${userResp.status}, accounts=${accountsResp.status}`)
-    throwCombinedCloudflareApiError(userResp.status, accountsResp.status)
+    throwCombinedCloudflareApiError(userResp, accountsResp)
   }
 
   // Parse user from response
@@ -149,7 +296,11 @@ export async function getUserAndAccounts(accessToken: string): Promise<{
 }
 
 /**
- * Handle token refresh for workers-oauth-provider
+ * Handle token refresh for workers-oauth-provider.
+ *
+ * Throws the local `OAuthError` (which extends the provider's exported
+ * `OAuthError`) for intentional refresh failures so workers-oauth-provider
+ * converts them into structured `/token` responses.
  */
 export async function handleTokenExchangeCallback(
   options: TokenExchangeCallbackOptions,
@@ -181,21 +332,25 @@ export async function handleTokenExchangeCallback(
     return undefined
   }
 
-  const { access_token, refresh_token, expires_in } = await refreshAuthToken({
-    client_id: clientId,
-    client_secret: clientSecret,
-    refresh_token: props.refreshToken,
-    oauthDomain: env.CLOUDFLARE_OAUTH_DOMAIN
-  })
+  const upstreamRefreshToken = props.refreshToken
 
-  return {
-    newProps: {
-      ...props,
-      accessToken: access_token,
-      refreshToken: refresh_token
-    } satisfies AuthProps,
-    accessTokenTTL: expires_in
-  }
+  return guardRefreshTokenExchange(env.OAUTH_KV, upstreamRefreshToken, async () => {
+    const { access_token, refresh_token, expires_in } = await refreshAuthToken({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: upstreamRefreshToken,
+      oauthDomain: env.CLOUDFLARE_OAUTH_DOMAIN
+    })
+
+    return {
+      newProps: {
+        ...props,
+        accessToken: access_token,
+        refreshToken: refresh_token
+      } satisfies AuthProps,
+      accessTokenTTL: expires_in
+    }
+  })
 }
 
 /**
@@ -309,7 +464,7 @@ export function createAuthHandlers() {
   // POST /authorize - Handle consent form submission
   app.post('/authorize', async (c) => {
     try {
-      const { state, headers, selectedScopes, selectedTemplate } = await parseRedirectApproval(
+      const { state, headers, selectedScopes } = await parseRedirectApproval(
         c.req.raw,
         env.MCP_COOKIE_ENCRYPTION_KEY
       )

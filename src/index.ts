@@ -1,59 +1,33 @@
 import OAuthProvider, { getOAuthApi } from '@cloudflare/workers-oauth-provider'
 import { Hono } from 'hono'
-import { WorkerEntrypoint } from 'cloudflare:workers'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 import { createServer } from './server'
 import { createAuthHandlers, handleTokenExchangeCallback } from './auth/oauth-handler'
 import { isDirectApiToken, handleApiTokenRequest } from './auth/api-token-mode'
 import { processSpec, extractProducts } from './spec-processor'
-import { fetchWithRetry } from './utils/fetch-retry'
+import { buildNonCodemodeTools, type OperationInfo } from './openapi'
 import type { AuthProps } from './auth/types'
 
-/**
- * Global outbound fetch handler that restricts dynamically-loaded workers
- * to only make requests to the configured Cloudflare API base URL.
- * The API token is injected via props so it never enters the user code isolate.
- */
-type GlobalOutboundProps = { apiToken: string; fetchWithRetryCaller: string }
-
-export class GlobalOutbound extends WorkerEntrypoint<Env, GlobalOutboundProps> {
-  async fetch(request: Request): Promise<Response> {
-    const allowed = new URL(this.env.CLOUDFLARE_API_BASE).hostname
-    const requested = new URL(request.url).hostname
-    if (requested !== allowed) {
-      return new Response(`Forbidden: requests to ${requested} are not allowed`, { status: 403 })
-    }
-    // Inject auth header — token comes from props, never enters user code isolate
-    const authedRequest = new Request(request, {
-      headers: new Headers([
-        ...request.headers.entries(),
-        ['Authorization', `Bearer ${this.ctx.props.apiToken}`]
-      ])
-    })
-    return fetchWithRetry(authedRequest, undefined, {
-      caller: this.ctx.props.fetchWithRetryCaller
-    })
-  }
-}
+// GlobalOutbound lives with the execute tool (its only caller); wrangler
+// resolves the GLOBAL_OUTBOUND worker-loader entrypoint from this entry module,
+// so it must be re-exported here.
+export { GlobalOutbound } from './tools/execute'
 
 type McpContext = {
   Bindings: Env
 }
 
 /**
- * Create MCP response for a given token and optional account ID
+ * Create an MCP response for the authenticated session described by `props`.
  */
 async function createMcpResponse(
   request: Request,
-  env: Env,
   ctx: ExecutionContext,
-  token: string,
-  accountId?: string,
-  props?: AuthProps
+  props: AuthProps
 ): Promise<Response> {
   const url = new URL(request.url)
   const codemode = url.searchParams.get('codemode') !== 'false'
-  const server = await createServer(env, ctx, token, accountId, props, codemode)
+  const server = await createServer(props, codemode)
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -83,8 +57,7 @@ function createMcpHandler() {
         headers: { 'Content-Type': 'application/json' }
       })
     }
-    const accountId = props.type === 'account_token' ? props.account.id : undefined
-    return createMcpResponse(c.req.raw, c.env, ctx, props.accessToken, accountId, props)
+    return createMcpResponse(c.req.raw, ctx, props)
   })
 
   return app
@@ -94,8 +67,8 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // Check for direct API token first (like GitHub MCP's PAT support)
     if (isDirectApiToken(request)) {
-      const response = await handleApiTokenRequest(request, (token, accountId, props) =>
-        createMcpResponse(request, env, ctx, token, accountId, props)
+      const response = await handleApiTokenRequest(request, (props) =>
+        createMcpResponse(request, ctx, props)
       )
       if (response) return response
     }
@@ -152,6 +125,8 @@ export default {
 
     const products = extractProducts(rawSpec)
     const productsJson = JSON.stringify(products)
+    const paths = (processed as { paths: Record<string, Record<string, OperationInfo>> }).paths
+    const nonCodemodeToolsJson = JSON.stringify(buildNonCodemodeTools(paths))
 
     console.log(`Writing spec to R2 (${(specJson.length / 1024).toFixed(0)} KB)`)
     await Promise.all([
@@ -159,6 +134,9 @@ export default {
         httpMetadata: { contentType: 'application/json' }
       }),
       env.SPEC_BUCKET.put('products.json', productsJson, {
+        httpMetadata: { contentType: 'application/json' }
+      }),
+      env.SPEC_BUCKET.put('non-codemode-tools.json', nonCodemodeToolsJson, {
         httpMetadata: { contentType: 'application/json' }
       })
     ])

@@ -12,14 +12,11 @@ import {
   handleTokenExchangeCallback
 } from '../../src/auth/oauth-handler'
 import { OAuthError } from '../../src/auth/workers-oauth-utils'
-import { API_BASE, cfSuccess } from '../helpers/cloudflare-api'
+import { API_BASE, cfAccountsSuccess, cfSuccess } from '../helpers/cloudflare-api'
 import { server } from '../setup/msw'
 
 /** Register MSW handlers for the two identity-probe endpoints by path. */
-function mockProbes(opts: {
-  user?: () => Response
-  accounts?: () => Response
-}) {
+function mockProbes(opts: { user?: () => Response; accounts?: () => Response }) {
   if (opts.user) server.use(http.get(`${API_BASE}/user`, opts.user))
   if (opts.accounts) server.use(http.get(`${API_BASE}/accounts`, opts.accounts))
 }
@@ -114,10 +111,94 @@ afterEach(async () => {
 })
 
 describe('getUserAndAccounts', () => {
+  it('requests enough accounts for the prompt-list cutoff to be detected', async () => {
+    let accountsUrl = ''
+    mockProbes({
+      user: () => HttpResponse.json(cfSuccess({ id: 'user-1', email: 'user@example.com' }))
+    })
+    server.use(
+      http.get(`${API_BASE}/accounts`, ({ request }) => {
+        accountsUrl = request.url
+        return HttpResponse.json(cfAccountsSuccess([]))
+      })
+    )
+
+    await getUserAndAccounts('test-token')
+
+    expect(new URL(accountsUrl).searchParams.get('per_page')).toBe('31')
+  })
+
+  it('records the count but omits the records when a user has too many accounts', async () => {
+    const accounts = Array.from({ length: 31 }, (_, index) => ({
+      id: `account-${index + 1}`,
+      name: `Account ${index + 1}`
+    }))
+    mockProbes({
+      user: () => HttpResponse.json(cfSuccess({ id: 'user-1', email: 'user@example.com' })),
+      accounts: () =>
+        HttpResponse.json({
+          ...cfSuccess(accounts),
+          result_info: { page: 1, per_page: 31, count: 31, total_count: 137 }
+        })
+    })
+
+    await expect(getUserAndAccounts('test-token')).resolves.toEqual({
+      user: { id: 'user-1', email: 'user@example.com' },
+      accounts: [],
+      accountCount: 137
+    })
+  })
+
+  it('warns and falls back to page count when total_count is missing', async () => {
+    const accounts = Array.from({ length: 31 }, (_, index) => ({
+      id: `account-${index + 1}`,
+      name: `Account ${index + 1}`
+    }))
+    mockProbes({
+      user: () => HttpResponse.json(cfSuccess({ id: 'user-1', email: 'user@example.com' })),
+      accounts: () =>
+        HttpResponse.json({
+          ...cfSuccess(accounts),
+          result_info: { page: 1, per_page: 31, count: 31 }
+        })
+    })
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    await expect(getUserAndAccounts('test-token')).resolves.toEqual({
+      user: { id: 'user-1', email: 'user@example.com' },
+      accounts: [],
+      accountCount: 31
+    })
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining('missing a valid result_info.total_count')
+    )
+  })
+
+  it('keeps the full list when a user is under the cutoff', async () => {
+    const accounts = Array.from({ length: 25 }, (_, index) => ({
+      id: `account-${index + 1}`,
+      name: `Account ${index + 1}`
+    }))
+    mockProbes({
+      user: () => HttpResponse.json(cfSuccess({ id: 'user-1', email: 'user@example.com' })),
+      accounts: () =>
+        HttpResponse.json({
+          ...cfSuccess(accounts),
+          result_info: { page: 1, per_page: 31, count: 25, total_count: 25 }
+        })
+    })
+
+    await expect(getUserAndAccounts('test-token')).resolves.toEqual({
+      user: { id: 'user-1', email: 'user@example.com' },
+      accounts
+    })
+  })
+
   it('accepts account-scoped token when /user fails but /accounts succeeds', async () => {
     mockProbes({
       user: () => new HttpResponse('Forbidden', { status: 403 }),
-      accounts: () => HttpResponse.json(cfSuccess([{ id: 'acc-1', name: 'Primary Account' }]))
+      accounts: () =>
+        HttpResponse.json(cfAccountsSuccess([{ id: 'acc-1', name: 'Primary Account' }]))
     })
 
     await expect(getUserAndAccounts('test-token')).resolves.toEqual({
@@ -192,7 +273,8 @@ describe('getUserAndAccounts', () => {
 
   it('preserves Retry-After from Cloudflare API 429 responses', async () => {
     mockProbes({
-      user: () => new HttpResponse('rate limited', { status: 429, headers: { 'Retry-After': '17' } }),
+      user: () =>
+        new HttpResponse('rate limited', { status: 429, headers: { 'Retry-After': '17' } }),
       accounts: () => new HttpResponse('rate limited', { status: 429 })
     })
 
@@ -221,7 +303,8 @@ describe('getUserAndAccounts', () => {
   it('falls back to account-scoped auth when /user is 200 but invalid JSON', async () => {
     mockProbes({
       user: () => new HttpResponse('not-json', { status: 200 }),
-      accounts: () => HttpResponse.json(cfSuccess([{ id: 'acc-1', name: 'Primary Account' }]))
+      accounts: () =>
+        HttpResponse.json(cfAccountsSuccess([{ id: 'acc-1', name: 'Primary Account' }]))
     })
 
     await expect(getUserAndAccounts('test-token')).resolves.toEqual({
@@ -233,7 +316,8 @@ describe('getUserAndAccounts', () => {
   it('falls back to account-scoped auth when /user is 200 with success=false', async () => {
     mockProbes({
       user: () => HttpResponse.json({ success: false }),
-      accounts: () => HttpResponse.json(cfSuccess([{ id: 'acc-1', name: 'Primary Account' }]))
+      accounts: () =>
+        HttpResponse.json(cfAccountsSuccess([{ id: 'acc-1', name: 'Primary Account' }]))
     })
 
     await expect(getUserAndAccounts('test-token')).resolves.toEqual({
@@ -257,7 +341,7 @@ describe('getUserAndAccounts', () => {
   it('rejects when /accounts returns empty result and /user fails', async () => {
     mockProbes({
       user: () => new HttpResponse('Forbidden', { status: 403 }),
-      accounts: () => HttpResponse.json(cfSuccess([]))
+      accounts: () => HttpResponse.json(cfAccountsSuccess([]))
     })
 
     await expectOAuthError(getUserAndAccounts('test-token'), 'invalid_token', 401)
@@ -601,10 +685,10 @@ describe('handleTokenExchangeCallback', () => {
 
   it('refreshes upstream tokens and returns updated auth props', async () => {
     // Real refreshAuthToken runs against the mocked upstream OAuth endpoint.
-    let body: string | undefined
+    let form: FormData | undefined
     server.use(
       http.post(OAUTH_TOKEN_URL, async ({ request }) => {
-        body = await request.text()
+        form = await request.formData()
         return HttpResponse.json({
           access_token: 'new-access-token',
           refresh_token: 'new-refresh-token',
@@ -627,8 +711,8 @@ describe('handleTokenExchangeCallback', () => {
     })
 
     // The real grant_type=refresh_token request hit the upstream endpoint.
-    expect(body).toContain('grant_type=refresh_token')
-    expect(body).toContain('refresh_token=old-refresh-token')
+    expect(form?.get('grant_type')).toBe('refresh_token')
+    expect(form?.get('refresh_token')).toBe('old-refresh-token')
   })
 
   it('throws the local OAuthError that extends the provider OAuthError', async () => {
@@ -662,9 +746,7 @@ describe('handleTokenExchangeCallback', () => {
   it('lets non-OAuth thrown errors propagate (surfaces as 500)', async () => {
     // Upstream 200 with a malformed token body -> real refreshAuthToken throws a
     // ZodError (non-OAuth), which must propagate untouched.
-    server.use(
-      http.post(OAUTH_TOKEN_URL, () => HttpResponse.json({ not: 'a token' }))
-    )
+    server.use(http.post(OAUTH_TOKEN_URL, () => HttpResponse.json({ not: 'a token' })))
 
     // Not an OAuthError: a ZodError from parsing the malformed token response.
     await expect(refreshCallback()).rejects.not.toBeInstanceOf(OAuthError)

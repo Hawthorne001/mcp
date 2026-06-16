@@ -1,9 +1,9 @@
 import { env } from 'cloudflare:workers'
 import { http, HttpResponse } from 'msw'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { API_BASE, cfSuccess, mockIdentityProbe } from './helpers/cloudflare-api'
+import { API_BASE, cfAccountsSuccess, cfSuccess, mockIdentityProbe } from './helpers/cloudflare-api'
 import { clearKv } from './helpers/kv'
-import { clearR2 } from './helpers/r2'
+import { clearSpec, seedSpec } from './helpers/spec'
 import { callTool, toolText } from './helpers/mcp'
 import { server } from './setup/msw'
 
@@ -21,7 +21,7 @@ const API_TOKEN = 'test-api-token-executor'
 
 afterEach(async () => {
   await clearKv(env.OAUTH_KV)
-  await clearR2(env.SPEC_BUCKET)
+  await clearSpec()
 })
 
 /** Run an `execute` tool call whose code hits `path`, with MSW returning `body`. */
@@ -42,7 +42,10 @@ async function runExecute(path: string, body: unknown, init?: ResponseInit): Pro
 
 describe('execute: REST responses', () => {
   it('returns the success envelope with the response status', async () => {
-    const text = await runExecute(`/accounts/${ACCOUNT_ID}/tokens/verify`, cfSuccess({ status: 'active' }))
+    const text = await runExecute(
+      `/accounts/${ACCOUNT_ID}/tokens/verify`,
+      cfSuccess({ status: 'active' })
+    )
     expect(text).toContain('"status": "active"')
     expect(text).toContain('"success": true')
   })
@@ -50,7 +53,12 @@ describe('execute: REST responses', () => {
   it('surfaces a clean "Cloudflare API error" for a failure envelope with errors', async () => {
     const text = await runExecute(
       `/accounts/${ACCOUNT_ID}/tokens/verify`,
-      { success: false, errors: [{ code: 1000, message: 'Invalid API Token' }], messages: [], result: null },
+      {
+        success: false,
+        errors: [{ code: 1000, message: 'Invalid API Token' }],
+        messages: [],
+        result: null
+      },
       { status: 403 }
     )
     expect(text).toContain('Cloudflare API error')
@@ -111,18 +119,56 @@ describe('execute: GraphQL responses', () => {
   })
 })
 
+describe('execute: no account resolved (multi-account user token)', () => {
+  // A user token spanning >1 account: account_id can't be auto-resolved, so an
+  // execute call without account_id binds no usable `accountId`.
+  function mockMultiAccountUser() {
+    mockIdentityProbe({
+      user: { id: 'u1', email: 'u@example.com' },
+      accounts: [
+        { id: ACCOUNT_ID, name: 'Acc One' },
+        { id: '00000000000000000000000000000002', name: 'Acc Two' }
+      ]
+    })
+  }
+
+  it('runs account-independent calls that never read accountId', async () => {
+    mockMultiAccountUser()
+    server.use(
+      http.get(`${API_BASE}/accounts`, () =>
+        HttpResponse.json(cfAccountsSuccess([{ id: ACCOUNT_ID, name: 'Acc One' }]))
+      )
+    )
+    const result = await callTool(API_TOKEN, 'execute', {
+      code: `async () => cloudflare.request({ method: "GET", path: "/accounts" })`
+    })
+    expect(result.result?.isError).toBeFalsy()
+    expect(toolText(result)).toContain('"success": true')
+  })
+
+  it('fails fast with a clear message when code reads the unset accountId', async () => {
+    mockMultiAccountUser()
+    const result = await callTool(API_TOKEN, 'execute', {
+      code: `async () => cloudflare.request({ method: "GET", path: \`/accounts/\${accountId}/workers/scripts\` })`
+    })
+    const text = toolText(result)
+    expect(text).toContain('No account selected')
+    expect(text).toContain('GET /accounts')
+    // Must not have silently produced an /accounts//... request.
+    expect(text).not.toContain('/accounts//')
+  })
+})
+
 describe('search: real SPEC_BUCKET', () => {
-  const SPEC = {
-    paths: {
-      '/accounts/{account_id}/workers/scripts': { get: { summary: 'List Workers' } }
-    }
+  const SPEC_PATHS = {
+    '/accounts/{account_id}/workers/scripts': { get: { summary: 'List Workers' } }
   }
 
   // The API-token path resolves identity before any tool runs.
   beforeEach(() => mockIdentityProbe({ accounts: [{ id: ACCOUNT_ID, name: 'Acc' }] }))
 
   it('evaluates code against the spec seeded in R2', async () => {
-    await env.SPEC_BUCKET.put('spec.json', JSON.stringify(SPEC))
+    await seedSpec(SPEC_PATHS)
 
     const result = await callTool(API_TOKEN, 'search', {
       code: `async () => Object.keys(spec.paths)`
@@ -131,12 +177,14 @@ describe('search: real SPEC_BUCKET', () => {
   })
 
   it('errors when spec.json is missing from R2', async () => {
-    const result = await callTool(API_TOKEN, 'search', { code: `async () => Object.keys(spec.paths)` })
+    const result = await callTool(API_TOKEN, 'search', {
+      code: `async () => Object.keys(spec.paths)`
+    })
     expect(toolText(result)).toContain('spec.json not found in R2')
   })
 
   it('has no network access (globalOutbound is null for search)', async () => {
-    await env.SPEC_BUCKET.put('spec.json', JSON.stringify(SPEC))
+    await seedSpec(SPEC_PATHS)
 
     const result = await callTool(API_TOKEN, 'search', {
       code: `async () => { await fetch("https://api.cloudflare.com/client/v4/user"); return "should not reach" }`

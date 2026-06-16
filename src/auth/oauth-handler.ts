@@ -1,6 +1,5 @@
 import { env as cloudflareEnv } from 'cloudflare:workers'
 import { Hono } from 'hono'
-import { z } from 'zod'
 
 import {
   generatePKCECodes,
@@ -15,7 +14,16 @@ import {
   MAX_SCOPES,
   REQUIRED_SCOPES
 } from './scopes'
-import { UserSchema, AccountsSchema, type AuthProps, type AccountSchema } from './types'
+import {
+  UserSchema,
+  AccountsSchema,
+  AuthProps as AuthPropsSchema,
+  AUTH_PROPS_VERSION,
+  ACCOUNTS_PROBE_PAGE_SIZE,
+  MAX_STORED_ACCOUNTS,
+  type AuthProps,
+  type AccountSchema
+} from './types'
 import {
   clientIdAlreadyApproved,
   createOAuthState,
@@ -29,6 +37,7 @@ import {
 } from './workers-oauth-utils'
 import { fetchWithRetry } from '../utils/fetch-retry'
 import { MetricsTracker, AuthUser } from '../metrics'
+import { SERVER_INFO } from '../constants'
 
 import type {
   AuthRequest,
@@ -44,7 +53,7 @@ interface AuthEnv extends Env {
 const env = cloudflareEnv as AuthEnv
 const REFRESH_GUARD_PREFIX = 'oauth:refresh-guard'
 
-const metrics = new MetricsTracker(env.MCP_METRICS, { name: 'cloudflare-api', version: '0.1.0' })
+const metrics = new MetricsTracker(env.MCP_METRICS, SERVER_INFO)
 
 /** Format an unknown thrown value into a stable `auth_user` error message. */
 function authErrorMessage(prefix: string, e: unknown): string {
@@ -375,7 +384,11 @@ async function fetchCloudflareProbes(
   try {
     return await Promise.all([
       fetchWithRetry(`${env.CLOUDFLARE_API_BASE}/user`, { headers }, { caller }),
-      fetchWithRetry(`${env.CLOUDFLARE_API_BASE}/accounts`, { headers }, { caller })
+      fetchWithRetry(
+        `${env.CLOUDFLARE_API_BASE}/accounts?per_page=${ACCOUNTS_PROBE_PAGE_SIZE}`,
+        { headers },
+        { caller }
+      )
     ])
   } catch (error) {
     console.error('Cloudflare API request failed', error)
@@ -392,6 +405,7 @@ export async function getUserAndAccounts(
 ): Promise<{
   user: UserSchema | null
   accounts: AccountSchema[]
+  accountCount?: number
 }> {
   const [userResp, accountsResp] = await fetchCloudflareProbes(accessToken, caller)
 
@@ -421,13 +435,32 @@ export async function getUserAndAccounts(
 
   // Parse accounts from response
   let accounts: AccountSchema[] = []
+  let totalAccountCount: number | undefined
   if (accountsResp.ok) {
     try {
-      const json = (await accountsResp.json()) as { success?: boolean; result?: unknown }
+      const json = (await accountsResp.json()) as {
+        success?: boolean
+        result?: unknown
+        result_info?: { count?: unknown; total_count?: unknown }
+      }
       if (json.success && json.result) {
         const parsed = AccountsSchema.safeParse(json.result)
         if (parsed.success) {
           accounts = parsed.data
+          const reported = json.result_info?.total_count
+          if (typeof reported === 'number' && Number.isFinite(reported) && reported >= 0) {
+            totalAccountCount = reported
+          } else {
+            const pageCount = json.result_info?.count
+            totalAccountCount =
+              typeof pageCount === 'number' && Number.isFinite(pageCount) && pageCount >= 0
+                ? Math.max(pageCount, accounts.length)
+                : accounts.length
+            console.warn(
+              `Cloudflare API /accounts response is missing a valid result_info.total_count; ` +
+                `falling back to page count ${totalAccountCount}`
+            )
+          }
         } else {
           console.error(
             'Cloudflare API /accounts payload did not match expected shape',
@@ -441,6 +474,11 @@ export async function getUserAndAccounts(
   }
 
   if (user) {
+    // Don't persist a long account list. Prefer the API-reported total; the
+    // page count fallback preserves availability if pagination metadata drifts.
+    if (totalAccountCount !== undefined && totalAccountCount > MAX_STORED_ACCOUNTS) {
+      return { user, accounts: [], accountCount: totalAccountCount }
+    }
     return { user, accounts }
   }
 
@@ -478,21 +516,6 @@ export async function handleTokenExchangeCallback(
   if (options.grantType !== 'refresh_token') {
     return undefined
   }
-
-  const AuthPropsSchema = z.discriminatedUnion('type', [
-    z.object({
-      type: z.literal('account_token'),
-      accessToken: z.string(),
-      account: z.object({ id: z.string(), name: z.string() })
-    }),
-    z.object({
-      type: z.literal('user_token'),
-      accessToken: z.string(),
-      user: z.object({ id: z.string(), email: z.string() }),
-      accounts: z.array(z.object({ id: z.string(), name: z.string() })),
-      refreshToken: z.string().optional()
-    })
-  ])
 
   const props = AuthPropsSchema.parse(options.props)
 
@@ -730,7 +753,7 @@ export function createAuthHandlers() {
       ])
 
       // Fetch user and accounts
-      const { user, accounts } = await getUserAndAccounts(access_token)
+      const { user, accounts, accountCount } = await getUserAndAccounts(access_token)
 
       // Account-scoped tokens (user: null) are only supported via API token mode
       // (see api-token-mode.ts). The OAuth flow always requires a user identity.
@@ -751,6 +774,8 @@ export function createAuthHandlers() {
           type: 'user_token',
           user,
           accounts,
+          accountCount,
+          version: AUTH_PROPS_VERSION,
           accessToken: access_token,
           refreshToken: refresh_token
         } satisfies AuthProps

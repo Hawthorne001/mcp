@@ -28,8 +28,8 @@ unsubscribe to remove it. No Durable Object, queue or new binding is used; the o
 state outside ANS is a short-lived delivery ticket in the existing `OAUTH_KV`.
 
 ANS's generic webhook format differs from MCP Events, so its destination targets
-`/events/ans/{subscriptionId}` on this server. This route checks the current policy
-and permissions, translates the notification, signs it and awaits acceptance:
+`/events/ans/{subscriptionId}` on this server. This route checks ANS's ingress
+credential, translates the notification, signs it and awaits acceptance:
 
 ```text
 Vega → ANS policy/destination → MCP callback adapter → subscriber
@@ -37,39 +37,49 @@ Vega → ANS policy/destination → MCP callback adapter → subscriber
 
 ### Metadata and credentials
 
-The policy description contains encrypted MCP metadata: owner, arguments, callback
-URL, signing keys, destination ID and expiry.
+This server stores no token and no signing secret. KV holds hashes only, as
+`workers-oauth-provider` does for OAuth tokens.
 
-ANS keeps a destination's secret from creation and ignores later updates, so the
-secret is a fixed per-subscription ingress credential,
-`HMAC(key, MCP_RESOURCE + subscription ID)`. It only proves the caller is ANS for
-that subscription. Everything that changes on refresh (policy ID, the subscriber's
-current bearer, expiry) is a delivery ticket in `OAUTH_KV` under
-`mcp-events:ticket:<subscription ID>`, rewritten on every subscribe and refresh and
-expiring with the subscription. The callback checks `cf-webhook-auth` against the
-HMAC, reads the ticket, and acknowledges without forwarding when there is none
-(ANS's creation probe, expiry or unsubscribe). Unsubscribe deletes the ticket
-first, so forwarding stops even if ANS cleanup fails.
+| Where | What it holds |
+| --- | --- |
+| ANS destination secret | The callback URL and the client's `whsec_` signing secret, sealed with AES-GCM. ANS holds it (write-only through its API) and presents it in `cf-webhook-auth` on every call |
+| `OAUTH_KV` `mcp-events:subscription:<id>` | Plain JSON: account, policy ID, alert type, current destination ID, SHA-256 of the signing secret, expiry. No secret; expires with the subscription |
+| ANS policy description | Encrypted metadata: owner, event, arguments, callback URL, SHA-256 of the signing secret, destination ID, expiry |
 
-Credentials are never placed in URLs or returned to MCP clients. The policy state
-and the ticket use AES-GCM with a purpose-specific key derived from
-`MCP_COOKIE_ENCRYPTION_KEY`, bound to `MCP_RESOURCE` and the subscription.
+The callback opens the presented secret (which is also the ingress check: it is
+authenticated and bound to the subscription), reads the KV record, checks the
+expiry and that the secret's hash matches the record, then signs and forwards.
+Recovering a signing secret needs both `MCP_COOKIE_ENCRYPTION_KEY` and ANS's store.
 
-No refresh token is retained. Provider-issued MCP tokens are revalidated through the
-existing OAuth provider. Direct Cloudflare tokens are rechecked by reading the
-policy and issue automations. Rotating the encryption key or changing the public
+ANS ignores updates to a destination's secret. A refresh with the same signing
+secret only rewrites the KV record. A new signing secret gets a new destination;
+the policy is pointed at it and the old destination is deleted. A destination
+whose secret no longer matches the record is acknowledged without forwarding,
+which also covers ANS's probe of a new destination. Because the previous secret is
+not kept, deliveries are signed with the current secret only (no dual-signing).
+
+No user credential is stored and delivery makes no Cloudflare API call. Access is
+checked on subscribe and on every refresh, with the caller's live credentials. A
+subscriber who loses access stops receiving events when the subscription expires
+(at most an hour), or at once on unsubscribe, which deletes the KV record first.
+
+Credentials are never placed in URLs or returned to MCP clients. Sealed values use
+a purpose-specific key derived from `MCP_COOKIE_ENCRYPTION_KEY`, bound to
+`MCP_RESOURCE` and the subscription.
+
+Rotating the encryption key or changing the public
 resource URL requires recreating subscriptions. Do not manually edit managed
 resource names or policy descriptions.
 
 Subscriptions default to 30 minutes and expire before the authenticating MCP token.
 `ttlMs` is clamped to between one minute and one hour, never rejected; `ttlMs: null`
 receives the one-hour maximum. `cursor` and `maxAgeMs` are accepted and ignored. Clients refresh
-before `refreshBefore`. Key rotation dual-signs for five minutes; callback verification
+before `refreshBefore`. Callback verification
 is cached in the policy for five minutes for the same owner, URL and key.
 
 Expiry stops delivery without a scheduler. Idle expired resources remain in ANS
-until refresh or unsubscribe. If permissions are revoked, the policy is disabled and
-an account administrator may need to remove the managed resources. `terminated` and
+until refresh or unsubscribe. If permissions are revoked, refresh fails and delivery
+stops at expiry; an account administrator may need to remove the managed resources. `terminated` and
 `gap` control envelopes are not sent (ChatGPT does not support them).
 
 ANS creation does not expose atomic create-if-absent. Sequential retries reuse
